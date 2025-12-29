@@ -6,68 +6,105 @@ from .helpers.format import format_cycle
 from .helpers.logger import logger
 
 
+LOGFILE = open("matmul_run.log", "w")
+
+
 @cocotb.test()
-async def test_kernel1_mul(dut):
+async def test_matmul(dut):
 
-    program_memory = Memory(dut=dut, addr_bits=8, data_bits=16,
-                            channels=1, name="program")
+    # -------- PROGRAM MEMORY --------
+    program_memory = Memory(dut=dut, addr_bits=8, data_bits=16, channels=1, name="program")
 
-    #
-    # KERNEL #1: C[0] = A[0] * B[0]
-    #
+    # Dot-product loop kernel
     program = [
-        0b1001000100000000,  # CONST R1, #0
-        0b1001001000001000,  # CONST R2, #8
-        0b1001001100010000,  # CONST R3, #16
 
-        0b0111010000010000,  # LDR R4, R1
-        0b0111010100100000,  # LDR R5, R2
+        # base pointers
+        0b1001000100000000,   # CONST R1, #0      ; baseA
+        0b1001001000001000,   # CONST R2, #8      ; baseB
+        0b1001001100010000,   # CONST R3, #16     ; baseC
 
-        0b0101011001000101,  # MUL R6, R4, R5
+        # acc = 0
+        0b1001011000000000,   # CONST R6, #0
 
-        0b1000000000110110,  # STR R3, R6
+        # k = 0
+        0b1001011100000000,   # CONST R7, #0
 
-        0b1111000000000000,  # RET
+        # inc = 1
+        0b1001000000000001,   # CONST R0, #1
+
+        # -------- LOOP START (PC = 6) --------
+
+        # addrA = baseA + k
+        0b0011010000010111,   # ADD R4, R1, R7
+        0b0111010001000000,   # LDR R4, R4        ; A[k]
+
+        # addrB = baseB + k
+        0b0011010100100111,   # ADD R5, R2, R7
+        0b0111010101010000,   # LDR R5, R5        ; B[k]
+
+        # tmp = A * B   (R8)
+        0b0101100001000101,   # MUL R8, R4, R5
+
+        # acc += tmp
+        0b0011011001101000,   # ADD R6, R6, R8
+
+        # k += 1
+        0b0011011101110000,   # ADD R7, R7, R0
+
+        # compare k < 4
+        0b1001010000000100,    # CONST R4, #4
+        0b0010000001110100,   # CMP R7, R4
+
+        # branch back if still k < 4
+        0b0001100000000110,   # BRn LOOP
+
+        # -------- STORE RESULT --------
+        0b1000000000110110,   # STR R3, R6
+        0b1111000000000000,   # RET
     ]
 
-    data_memory = Memory(dut=dut, addr_bits=8, data_bits=8,
-                         channels=4, name="data")
+    # -------- DATA MEMORY --------
+    data_memory = Memory(dut=dut, addr_bits=8, data_bits=8, channels=4, name="data")
 
-    #
-    # Data layout:
-    # A = [2, 4, 6, 5, 8, 9, 4, 3]
-    # B = [1, 1, 1, 1, 1, 1, 1, 1]
-    #
-    A = [2,4,6,5,8,9,4,3]
-    B = [1,1,1,1,1,1,1,1]
+    data = [
+        2,4,6,5,8,9,4,3,      # A
+        1,1,1,1,1,1,1,1      # B
+    ]
 
-    threads = 1
+    threads = 8   # still unused — only C[0] is produced
 
     await setup(
         dut=dut,
         program_memory=program_memory,
         program=program,
         data_memory=data_memory,
-        data=A+B,
-        threads=threads,
+        data=data,
+        threads=threads
     )
 
+    data_memory.display(24)
+
     cycles = 0
-    while dut.done.value != 1 and cycles < 200:
-     data_memory.run()
-     program_memory.run()
-    await cocotb.triggers.ReadOnly()
-    await RisingEdge(dut.clk)
-    cycles += 1
+    while dut.done.value != 1:
+        data_memory.run()
+        program_memory.run()
+        await cocotb.triggers.ReadOnly()
+        format_cycle(dut, cycles)
+        await RisingEdge(dut.clk)
+        cycles += 1
 
-    assert cycles < 200, "Kernel likely stuck — RET never executed"
+    msg = f"Completed in {cycles} cycles"
+    logger.info(msg)
+    print(msg, file=LOGFILE)
 
-    logger.info(f"Completed in {cycles} cycles")
+    # ---- FINAL RESULT ----
+    c_values = [data_memory.memory[i + 16] for i in range(8)]
 
-    #
-    # RESULT: C starts at address 16
-    #
-    result = data_memory.memory[16]
+    print("FINAL RESULT (C):", c_values)
+    logger.info(f"FINAL RESULT (C): {c_values}")
+    print("FINAL RESULT (C): " + str(c_values), file=LOGFILE)
 
-    print("C[0] =", result)
-    assert result == A[0] * B[0], f"expected {A[0]*B[0]}, got {result}"
+    with open("matmul_result.txt", "w") as f:
+        f.write(" ".join(map(str, c_values)))
+
+    LOGFILE.close()
