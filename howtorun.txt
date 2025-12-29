@@ -1,0 +1,10 @@
+dont run in terminal ("cat is not recognised")
+open git bash
+go to directory cd /c/Users/HP/Desktop/tinygpu/tiny-gpu 
+check for path of python310 
+export PATH="/c/Users/HP/AppData/Local/Programs/Python/Python310:$PATH"
+export PATH="/c/Users/HP/AppData/Local/Programs/Python/Python310/lib/site-packages/cocotb/libs:$PATH"
+, run which python 
+this should show python310
+then run make test_matadd
+and make test_matmul
