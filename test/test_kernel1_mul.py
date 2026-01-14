@@ -1,77 +1,84 @@
 import cocotb
-from cocotb.triggers import RisingEdge
+from cocotb.triggers import RisingEdge, ReadOnly
+from PIL import Image
+import numpy as np
+
 from .helpers.setup import setup
 from .helpers.memory import Memory
 from .helpers.format import format_cycle
 from .helpers.logger import logger
 
 
-LOGFILE = open("matmul_run.log", "w")
-
-
 @cocotb.test()
-async def test_matmul(dut):
+async def test_grayscale_fixed_point(dut):
 
-    # -------- PROGRAM MEMORY --------
-    program_memory = Memory(dut=dut, addr_bits=8, data_bits=16, channels=1, name="program")
+    # --------------------------------------------------
+    # Load image on host
+    # --------------------------------------------------
+    img = Image.open("input.jpeg").convert("RGB")
+    width, height = img.size
+    pixels = np.array(img).reshape(-1, 3)
 
-    # Dot-product loop kernel
+    rgb_flat = []
+    for r, g, b in pixels:
+        rgb_flat.extend([int(r), int(g), int(b)])
+
+    num_pixels = len(pixels)
+
+    # --------------------------------------------------
+    # Program memory (GPU kernel)
+    # --------------------------------------------------
+    program_memory = Memory(
+        dut=dut, addr_bits=8, data_bits=16, channels=1, name="program"
+    )
+
     program = [
+        0b0101000011011110,  # MUL R0, %blockIdx, %blockDim
+        0b0011000000001111,  # ADD R0, R0, %threadIdx        ; i
 
-        # base pointers
-        0b1001000100000000,   # CONST R1, #0      ; baseA
-        0b1001001000001000,   # CONST R2, #8      ; baseB
-        0b1001001100010000,   # CONST R3, #16     ; baseC
+        0b1001000100010011,  # CONST R1, #299
+        0b1001001000100101,  # CONST R2, #587
+        0b1001001100001110,  # CONST R3, #114
 
-        # acc = 0
-        0b1001011000000000,   # CONST R6, #0
+        0b1001010000000000,  # CONST R4, #0      ; rgb_base
+        0b1001010101000000,  # CONST R5, #64     ; gray_base
 
-        # k = 0
-        0b1001011100000000,   # CONST R7, #0
+        0b0101100000000011,  # MUL R6, R0, R3    ; addr = i * 3
+        0b0011101101100100,  # ADD R6, R6, R4
 
-        # inc = 1
-        0b1001000000000001,   # CONST R0, #1
+        0b0111100110000000,  # LDR R7, R6        ; R
+        0b1001001100000001,  # CONST R3, #1
+        0b0011101101100011,  # ADD R6, R6, R3
+        0b0111101000000000,  # LDR R8, R6        ; G
+        0b0011101101100011,  # ADD R6, R6, R3
+        0b0111101001000000,  # LDR R9, R6        ; B
 
-        # -------- LOOP START (PC = 6) --------
+        0b0101110101110001,  # MUL R10, R7, R1   ; 299*R
+        0b0101110110000010,  # MUL R11, R8, R2   ; 587*G
+        0b0011101010101011,  # ADD R10, R10, R11
+        0b0101110110010011,  # MUL R11, R9, R3   ; 114*B
+        0b0011101010101011,  # ADD R10, R10, R11
 
-        # addrA = baseA + k
-        0b0011010000010111,   # ADD R4, R1, R7
-        0b0111010001000000,   # LDR R4, R4        ; A[k]
+        0b0011100101010000,  # ADD R9, R5, R0
+        0b1000000010011010,  # STR R9, R10
 
-        # addrB = baseB + k
-        0b0011010100100111,   # ADD R5, R2, R7
-        0b0111010101010000,   # LDR R5, R5        ; B[k]
-
-        # tmp = A * B   (R8)
-        0b0101100001000101,   # MUL R8, R4, R5
-
-        # acc += tmp
-        0b0011011001101000,   # ADD R6, R6, R8
-
-        # k += 1
-        0b0011011101110000,   # ADD R7, R7, R0
-
-        # compare k < 4
-        0b1001010000000100,    # CONST R4, #4
-        0b0010000001110100,   # CMP R7, R4
-
-        # branch back if still k < 4
-        0b0001100000000110,   # BRn LOOP
-
-        # -------- STORE RESULT --------
-        0b1000000000110110,   # STR R3, R6
-        0b1111000000000000,   # RET
+        0b1111000000000000   # RET
     ]
 
-    # -------- DATA MEMORY --------
-    data_memory = Memory(dut=dut, addr_bits=8, data_bits=8, channels=4, name="data")
+    # --------------------------------------------------
+    # Data memory
+    # --------------------------------------------------
+    data_memory = Memory(
+        dut=dut, addr_bits=8, data_bits=32, channels=1, name="data"
+    )
 
-    data = [
-        2,4,6,5,8,9,4,3,      # A
-        1,1,1,1,1,1,1,1      # B
-    ]
+    # RGB data first, grayscale output after
+    data = rgb_flat + [0] * num_pixels
 
-    threads = 8   # still unused — only C[0] is produced
+    # --------------------------------------------------
+    # Launch GPU
+    # --------------------------------------------------
+    threads = num_pixels
 
     await setup(
         dut=dut,
@@ -82,29 +89,34 @@ async def test_matmul(dut):
         threads=threads
     )
 
-    data_memory.display(24)
-
+    # --------------------------------------------------
+    # Run simulation
+    # --------------------------------------------------
     cycles = 0
     while dut.done.value != 1:
         data_memory.run()
         program_memory.run()
-        await cocotb.triggers.ReadOnly()
-        format_cycle(dut, cycles)
+
+        await ReadOnly()
+        format_cycle(dut, cycles, thread_id=0)
+
         await RisingEdge(dut.clk)
         cycles += 1
 
-    msg = f"Completed in {cycles} cycles"
-    logger.info(msg)
-    print(msg, file=LOGFILE)
+    logger.info(f"Completed in {cycles} cycles")
 
-    # ---- FINAL RESULT ----
-    c_values = [data_memory.memory[i + 16] for i in range(8)]
+    # --------------------------------------------------
+    # Read back grayscale accumulator
+    # --------------------------------------------------
+    gray_base = len(rgb_flat)
+    gray_acc = data_memory.memory[gray_base:gray_base + num_pixels]
 
-    print("FINAL RESULT (C):", c_values)
-    logger.info(f"FINAL RESULT (C): {c_values}")
-    print("FINAL RESULT (C): " + str(c_values), file=LOGFILE)
+    # --------------------------------------------------
+    # Convert back to image (HOST SIDE)
+    # --------------------------------------------------
+    gray = (np.array(gray_acc) // 1000).astype(np.uint8)
+    gray_img = gray.reshape(height, width)
 
-    with open("matmul_result.txt", "w") as f:
-        f.write(" ".join(map(str, c_values)))
+    Image.fromarray(gray_img, mode="L").save("grayscale_output.png")
 
-    LOGFILE.close()
+    logger.info("Grayscale image generated successfully")

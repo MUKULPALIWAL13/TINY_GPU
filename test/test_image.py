@@ -5,7 +5,7 @@ from .helpers.memory import Memory
 from .helpers.format import format_cycle
 from .helpers.logger import logger
 
-LOGFILE = open("matmul_run.log", "w")
+LOGFILE = open("grayscale_run.log", "w")
 
 
 # ---------------- MINI ASSEMBLER ----------------
@@ -17,14 +17,14 @@ def R(x):
 def assemble(asm):
     lines = []
     for l in asm.splitlines():
-        l = l.split(";")[0].strip()   # strip comments
+        l = l.split(";")[0].strip()
         if l:
             lines.append(l)
 
     labels = {}
     pc = 0
 
-    # First pass: labels
+    # First pass: collect labels
     for l in lines:
         if l.endswith(":"):
             labels[l[:-1]] = pc
@@ -32,9 +32,8 @@ def assemble(asm):
             pc += 1
 
     code = []
-    pc = 0
 
-    # Second pass: encode
+    # Second pass: encode instructions
     for l in lines:
         if l.endswith(":"):
             continue
@@ -75,84 +74,58 @@ def assemble(asm):
         else:
             raise ValueError(f"Unknown opcode {op}")
 
-        pc += 1
-
     return code
 
 
+# ---------------- GRAYSCALE ASM (8 PIXELS) ----------------
 
-# ---------------- FULL MATRIX MULTIPLY KERNEL ----------------
 ASM = """
-
-; ----------------------------------------
-; Compute global thread index
 ; i = blockIdx * blockDim + threadIdx
-; ----------------------------------------
 MUL R0, R13, R14
 ADD R0, R0, R15
 
-; ----------------------------------------
-; Constants
-; ----------------------------------------
-CONST R1, #0      ; baseA
-CONST R2, #8      ; baseB
-CONST R3, #16     ; baseC
+; base pointers
+CONST R1, #0      ; baseRGB
+CONST R2, #24     ; baseGray
 
-CONST R4, #2      ; N (columns of C)
-CONST R5, #4      ; K (inner dimension)
-CONST R6, #1      ; increment
+; addrRGB = baseRGB + 3*i
+ADD R3, R0, R0
+ADD R3, R3, R0
+ADD R3, R3, R1
 
-; ----------------------------------------
-; row = i / N
-; col = i - row*N
-; ----------------------------------------
-DIV R7, R0, R4
-MUL R8, R7, R4
-SUB R8, R0, R8
+; load R, G, B
+LDR R4, R3
+CONST R7, #1
+ADD R3, R3, R7
+LDR R5, R3
+ADD R3, R3, R7
+LDR R6, R3
 
-; ----------------------------------------
-; acc = 0, k = 0
-; ----------------------------------------
-CONST R9, #0      ; acc
-CONST R10, #0     ; k
+; gray = (R/4) + (G/2) + (B/8)
+CONST R7, #4
+DIV R4, R4, R7
 
-; ----------------------------------------
-; LOOP: for k in [0, K)
-; ----------------------------------------
-LOOP:
-    ; addrA = baseA + row*K + k
-    MUL R11, R7, R5
-    ADD R11, R11, R10
-    ADD R11, R11, R1
-    LDR R12, R11
+CONST R7, #2
+DIV R5, R5, R7
 
-    ; addrB = baseB + k*N + col
-    MUL R11, R10, R4
-    ADD R11, R11, R8
-    ADD R11, R11, R2
-    LDR R11, R11
+CONST R7, #8
+DIV R6, R6, R7
 
-    ; acc += A * B
-    MUL R12, R12, R11
-    ADD R9, R9, R12
+ADD R4, R4, R5
+ADD R4, R4, R6
 
-    ; k++
-    ADD R10, R10, R6
-    CMP R10, R5
-    BRn LOOP
-
-; ----------------------------------------
-; Store result: C[i] = acc
-; ----------------------------------------
-ADD R0, R0, R3
-STR R0, R9
+; store gray (DO NOT modify base register)
+ADD R7, R2, R0
+STR R7, R4
 
 RET
 """
 
 
+# ---------------- TEST ----------------
+
 @cocotb.test()
-async def test_matmul(dut):
+async def test_grayscale_8(dut):
 
     program = assemble(ASM)
 
@@ -164,17 +137,17 @@ async def test_matmul(dut):
         dut=dut, addr_bits=8, data_bits=8, channels=4, name="data"
     )
 
+    # 8 RGB pixels
     data = [
-    # A (2x4)
-    10, 21, 31, 42,
-    5, 69, 7, 81,
-
-    # B (4x2)
-    1, 87,
-    6, 1,
-    15, 0,
-    81, 19,
-]
+        255, 0,   0,     # red
+        0,   255, 0,     # green
+        0,   0,   255,   # blue
+        255, 255, 255,  # white
+        0,   0,   0,     # black
+        128, 128, 128,  # gray
+        50,  100, 150,
+        10,  20,  30,
+    ] + [0]*8   # output space
 
     await setup(
         dut=dut,
@@ -182,7 +155,7 @@ async def test_matmul(dut):
         program=program,
         data_memory=data_memory,
         data=data,
-        threads=4,
+        threads=8,
     )
 
     cycles = 0
@@ -197,15 +170,15 @@ async def test_matmul(dut):
         await RisingEdge(dut.clk)
         cycles += 1
 
-        if cycles > 8000:
+        if cycles > 2000:
             raise RuntimeError("Timeout: possible infinite loop")
 
     logger.info(f"Completed in {cycles} cycles")
     print(f"Completed in {cycles} cycles", file=LOGFILE)
 
-    C = [data_memory.memory[i + 16] for i in range(4)]
-    print("FINAL RESULT (C):", C)
-    logger.info(f"FINAL RESULT (C): {C}")
-    print("FINAL RESULT (C):", C, file=LOGFILE)
+    gray = [data_memory.memory[i + 24] for i in range(8)]
+    print("FINAL RESULT (GRAY):", gray)
+    logger.info(f"FINAL RESULT (GRAY): {gray}")
+    print("FINAL RESULT (GRAY):", gray, file=LOGFILE)
 
     LOGFILE.close()
